@@ -3,7 +3,7 @@
 import os
 import numpy as np
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -17,7 +17,7 @@ __all__ = [
     "MaskTransform",
     "DeepLenseSRDataset",
     "DeepLenseDiffusionDataset",
-    "DeepLenseMaskedDataset"
+    "DeepLenseMaskedDataset",
 ]
 
 
@@ -42,7 +42,10 @@ class PatchTransform(nn.Module):
         x = x.unfold(1, self.patch_height, self.patch_height)  # 3 x 8 x 32 x 4
         x = x.unfold(2, self.patch_width, self.patch_width)  # 3 x 8 x 8 x 4 x 4
 
-        return x.reshape(-1, self.patch_width * self.patch_height * 3)  # -1 x 48 == 64 x 48
+        return x.reshape(
+            -1, self.patch_width * self.patch_height * 3
+        )  # -1 x 48 == 64 x 48
+
 
 class MaskTransform(nn.Module):
     def __init__(
@@ -50,7 +53,7 @@ class MaskTransform(nn.Module):
         num_patches: int,
         use_mask: bool = False,
         mask_token: int = -100,
-        mask_ratio: float =.75
+        mask_ratio: float = 0.75,
     ):
         super(MaskTransform, self).__init__()
 
@@ -80,12 +83,9 @@ class MaskTransform(nn.Module):
     def forward(self, x: torch.Tensor) -> Sequence[torch.Tensor]:
         return self.mask_patches(x)
 
+
 class DeepLenseSRDataset(Dataset):
-    def __init__(
-        self,
-        path: Optional[str] = None,
-        finetune: bool = False
-    ):
+    def __init__(self, path: Optional[str] = None, finetune: bool = False):
         super().__init__()
 
         if path is None:
@@ -123,28 +123,28 @@ class DeepLenseSRDataset(Dataset):
         return self.preprocess_image(x_lr), self.preprocess_image(x_hr)
 
     def to_dataloader(
-        self,
-        num_workers: int = 0,
-        batch_size: int = 1,
-        pin_memory: bool = True
+        self, num_workers: int = 0, batch_size: int = 1, pin_memory: bool = True
     ) -> DataLoader:
         dataloader = DataLoader(
             dataset=self,
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            shuffle=True
+            shuffle=True,
         )
         return dataloader
 
     def __str__(self):
-        return f"{self.__class__.__name__}(path = {self.path}, finetune = {self.finetune})"
+        return (
+            f"{self.__class__.__name__}(path = {self.path}, finetune = {self.finetune})"
+        )
+
 
 class DeepLenseDiffusionDataset(Dataset):
     def __init__(
         self,
         diffusion_helper: DiffusionHelper = DiffusionHelper(),
-        input_size: Optional[int, Sequence[int, int]] = 160,
+        input_size: Union[int, Sequence[int]] = 160,
         path: Optional[str] = None,
     ):
         super().__init__()
@@ -156,10 +156,7 @@ class DeepLenseDiffusionDataset(Dataset):
         self.input_size = input_size
         self.diffusion_helper = diffusion_helper
 
-        self.files = [
-            os.path.join(path, f)
-            for f in os.listdir(path)
-        ]
+        self.files = [os.path.join(path, f) for f in os.listdir(path)]
 
         if self.input_size:
             t = T.Resize((self.input_size, self.input_size))
@@ -168,51 +165,42 @@ class DeepLenseDiffusionDataset(Dataset):
         else:
             t = T.Lambda(lambda x: x)
 
-        self.tensor_transform = T.Compose(
-            [
-                t,
-                T.Normalize(mean = (.5,), std = (.5,))
-            ]
-        )
+        self.tensor_transform = T.Compose([t, T.Normalize(mean=(0.5,), std=(0.5,))])
 
     def __len__(self) -> int:
         return len(self.files)
 
     @staticmethod
     def preprocess_image(path: str) -> torch.Tensor:
-        return torch.tensor(np.load(path))
+        return torch.tensor(np.load(path), dtype = torch.float)
 
     def __getitem__(self, idx: int) -> [torch.Tensor]:
         img = self.files[idx]
+        x = self.tensor_transform(self.preprocess_image(img))
 
-        return self.tensor_transform(self.preprocess_image(img))
+        x_t, noise, t = self.diffusion_helper.generate_corrupted_samples(x=x, num_time_steps=1)
+
+        return x, x_t, t, noise
 
     def to_dataloader(
-        self,
-        num_workers: int = 0,
-        batch_size: int = 1,
-        pin_memory: bool = True
+        self, num_workers: int = 0, batch_size: int = 1, pin_memory: bool = True
     ) -> DataLoader:
         dataloader = DataLoader(
             dataset=self,
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            shuffle=True
+            shuffle=True,
         )
         return dataloader
 
     def __str__(self):
         return f"{self.__class__.__name__}(path = {self.path})"
 
+
 class DeepLenseMaskedDataset(Dataset):
     def __init__(
-        self,
-        use_mask=False,
-        num_patches=64,
-        image_size = 224,
-        mask_ratio=.75,
-        path=None
+        self, use_mask=False, num_patches=64, image_size=224, mask_ratio=0.75, path=None
     ):
         super().__init__()
 
@@ -239,15 +227,10 @@ class DeepLenseMaskedDataset(Dataset):
         self.tensor_transform = T.PILToTensor()
 
         self.patch_transform = T.Compose(
-            [
-                self.tensor_transform,
-                PatchTransform(num_patches, image_size=image_size)
-            ]
+            [self.tensor_transform, PatchTransform(num_patches, image_size=image_size)]
         )
         self.mask_transform = MaskTransform(
-            num_patches=num_patches,
-            mask_ratio=mask_ratio,
-            use_mask=use_mask
+            num_patches=num_patches, mask_ratio=mask_ratio, use_mask=use_mask
         )
 
     def __len__(self):
@@ -264,8 +247,10 @@ class DeepLenseMaskedDataset(Dataset):
         return self.preprocess_image(lr_fname), self.preprocess_image(hr_fname)
 
     def __str__(self):
-        params = (f"use_mask = {self.use_mask}, num_patches = {self.num_patches},"
-                  f" image_size = {self.image_size}, mask_ratio = {self.mask_ratio}")
+        params = (
+            f"use_mask = {self.use_mask}, num_patches = {self.num_patches},"
+            f" image_size = {self.image_size}, mask_ratio = {self.mask_ratio}"
+        )
         return f"{self.__class__.__name__}({params})"
 
 
@@ -291,12 +276,15 @@ if __name__ == "__main__":
 
     dataset = DeepLenseDiffusionDataset(diffusion_helper=DiffusionHelper())
 
-    X = dataset[0]
+    x, x_t, t, noise = dataset[0]
 
-    print(X.shape)
+    print(x_t.shape)
     print(dataset)
 
     from matplotlib import pyplot as plt
 
-    plt.imshow(X.permute(1, 2, 0).numpy(), cmap = "gray")
+    plt.imshow(x.permute(1, 2, 0).numpy(), cmap="gray")
+    plt.show()
+
+    plt.imshow(x_t.permute(1, 2, 0).numpy(), cmap="gray")
     plt.show()

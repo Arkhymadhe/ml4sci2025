@@ -7,9 +7,9 @@ import os
 import json
 
 from src.deeplense.loss import SuperResolutionLoss
-# Import model here: from src.deeplense.models import
+from src.deeplense.models import UNet, UNetTransformer
 
-from src.deeplense.dataset import DeepLenseSRDataset, DeepLenseMaskedDataset
+from src.deeplense.dataset import DeepLenseSRDataset, DeepLenseMaskedDataset, DeepLenseDiffusionDataset
 
 ##### Ensure reproducibility
 torch.backends.cudnn.deterministic = True
@@ -19,57 +19,59 @@ SEED = 42
 torch.cuda.manual_seed(SEED)
 torch.manual_seed(SEED)
 
+##### Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 ##### Model architecture
-encoder_name = "resnet34"
 in_channels = 3
-freeze_encoder = True # TODO: Experiment with freezing encoder (original: True)
-encoder_weights = "imagenet"
-checkpoint = 2 # TODO: Experiment with loading previous model checkpoint (original: None)
-smp = False
+out_channels = 64
+num_blocks = 4
+
+embedding_dim = 512
+num_time_steps = 1000
 
 model_params = dict(
-    encoder_name = encoder_name,
-    in_channels = in_channels,
-    freeze_encoder = freeze_encoder,
-    encoder_weights = encoder_weights,
-    checkpoint = checkpoint,
-    smp = smp,
+    in_channels=in_channels,
+    out_channels=out_channels,
+    num_blocks=num_blocks,
 )
 
 ##### Data preparation
 num_classes = 10
-batch_size = 8 # TODO: Experiment with batch size (original: 16)
+batch_size = 8  # TODO: Experiment with batch size (original: 16)
 num_workers = 0
 pin_memory = True
 finetuning_dataset = False
 
 data_params = dict(
-    num_classes = num_classes,
-    batch_size = batch_size,
+    num_classes=num_classes,
+    batch_size=batch_size,
 )
 
 #### Objective function hyperparameters
-fourier_loss_weight = .5
-amplitude_weight = .5
-layers = [8, 17, 25]
-progressive_weights = False
+fourier_loss_weight = 0.5  # Importance of fourier loss
+amplitude_weight = 0.5  # Importance of amplitude vs phase losses
+layers = [8, 17, 25]  # VGG layers for content loss
+progressive_weights = False  # Ramp up VGG layer importance with depth
 
 ##### Training process
-epochs = 20 # TODO: Experiment with this (original: 10)
-reduce = True
-decoder_lr = 1e-4 # TODO: Experiment with this (original: 1e-4)
-encoder_lr = 1e-4 # TODO: Experiment with this (original: 1e-4)
+epochs = 20  # TODO: Experiment with this (original: 10)
+
+decoder_lr = 1e-4  # TODO: Experiment with this (original: 1e-4)
+encoder_lr = 1e-4  # TODO: Experiment with this (original: 1e-4)
+bottleneck_lr = 1e-4
+
 weight_decay = 1e-2
-gamma = 2. # TODO: Experiment with this (original: 0.)
 grad_accum_steps = 1
 
 training_params = dict(
-    epochs = epochs,
+    epochs=epochs,
     weight_decay=weight_decay,
     encoder_lr=encoder_lr,
     decoder_lr=decoder_lr,
-    gamma=gamma
+    bottleneck_lr=bottleneck_lr,
+    grad_accum_steps=grad_accum_steps,
 )
 
 final_params = {}
@@ -99,9 +101,7 @@ with open(f"{checkpoint_dir}/params.json", "w") as fp:
 
 train_ds = DeepLenseSRDataset(finetune=finetuning_dataset)
 train_dataloader = train_ds.to_dataloader(
-    batch_size=batch_size,
-    num_workers=num_workers,
-    pin_memory=pin_memory
+    batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory
 )
 
 IN, MASK = next(iter(train_dataloader))
@@ -115,15 +115,8 @@ print(f"MASK dtype:", MASK.dtype)
 
 ##### Model instantiation
 
-model = load_unet_model(
-    encoder_name=encoder_name,
-    encoder_weights=encoder_weights,
-    freeze_encoder=freeze_encoder,
-    num_classes=num_classes,
-    in_channels=in_channels,
-    checkpoint=checkpoint,
-    smp=smp
-)
+model = UNet(in_channels=in_channels, out_channels=out_channels, num_blocks=num_blocks)
+
 
 model = model.train()
 
@@ -131,41 +124,43 @@ model = model.train()
 
 param_groups = []
 
-if not freeze_encoder:
-    encoder_params = {
-        "params": filter(lambda x: x.requires_grad, model.encoder.parameters()),
-        "lr": encoder_lr,
-    }
-    param_groups.append(encoder_params)
+
+encoder_params = {
+    "params": filter(lambda x: x.requires_grad, model.encoder.parameters()),
+    "lr": encoder_lr,
+}
+
+bottleneck_params = {
+    "params": filter(lambda x: x.requires_grad, model.bottleneck.parameters()),
+    "lr": bottleneck_lr,
+}
 
 decoder_params = {
-    "params":filter(lambda x: x.requires_grad, model.decoder.parameters()),
+    "params": filter(lambda x: x.requires_grad, model.decoder.parameters()),
     "lr": decoder_lr,
 }
 
+param_groups.append(encoder_params)
+param_groups.append(bottleneck_params)
 param_groups.append(decoder_params)
 
 ##### Optimizer instantiation
-optimizer = optim.AdamW(
-    params=param_groups,
-    lr=encoder_lr,
-    weight_decay=weight_decay
-)
+optimizer = optim.AdamW(params=param_groups, lr=encoder_lr, weight_decay=weight_decay)
 
 ##### Objective function instantiation
 criterion = SuperResolutionLoss(
     fourier_loss_weight=fourier_loss_weight,
     amplitude_weight=amplitude_weight,
     layers=layers,
-    progressive_weights=progressive_weights
+    progressive_weights=progressive_weights,
 )
 
 ##### Trainer instantiation
 trainer = Trainer(
-    model=model,                    # UNet model with pretrained backbone
-    criterion=criterion,     # loss function for model convergence
-    optimizer=optimizer,      # optimizer for regularization
-    epochs=epochs                 # number of epochs for model training
+    model=model,  # UNet model with pretrained backbone
+    criterion=criterion,  # loss function for model convergence
+    optimizer=optimizer,  # optimizer for regularization
+    epochs=epochs,  # number of epochs for model training
 )
 
 ##### Model training

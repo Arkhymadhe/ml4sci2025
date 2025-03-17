@@ -2,26 +2,38 @@
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint_sequential
 from torch.utils.data import Dataset, DataLoader
+
 from torch.nn import functional as F
 from torchinfo import summary
 
-from typing import Union, Optional
+from typing import Union, Optional, Sequence
 
 __all__ = [
     "MaskedAutoEncoder",
     "MaskTransformer",
-    "FourierDiscriminator"
+    "FourierDiscriminator",
+    "DiffusionHelper",
+    "UNetConvBlock",
+    "UNetConvTransposeBlock",
+    "UNetEncoder",
+    "UNetDecoder",
+    "UNetBottleneck",
+    "UNetMHSABottleneck",
+    "UNet",
+    "UNetTransformer",
 ]
+
 
 class MaskedAutoEncoder(nn.Module):
     def __init__(
         self,
-        input_size = 128,
-        hidden_size = 1024,
+        input_size=128,
+        hidden_size=1024,
         num_heads=32,
         forward_dim=2048,
-        num_encoder_layers=3
+        num_encoder_layers=3,
     ):
         super(MaskedAutoEncoder, self).__init__()
 
@@ -30,22 +42,23 @@ class MaskedAutoEncoder(nn.Module):
         self.forward_dim = forward_dim
         self.num_encoder_layers = num_encoder_layers
 
-        self.projector = nn.Linear(in_features=input_size, out_features = hidden_size)
+        self.projector = nn.Linear(in_features=input_size, out_features=hidden_size)
         self.encoder = nn.Transformer(
             d_model=hidden_size,
             nhead=num_heads,
             dim_feedforward=forward_dim,
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=0,
-            batch_first=True
+            batch_first=True,
         ).encoder
 
     def forward(self, x):
         x = self.projector(x)
         return self.encoder(x)
 
+
 class MaskTransformer(nn.Module):
-    def __init__(self, use_mask=False, mask_token = -100, mask_ratio=.75):
+    def __init__(self, use_mask=False, mask_token=-100, mask_ratio=0.75):
         super(MaskTransformer, self).__init__()
 
         self.mask_ratio = mask_ratio
@@ -60,9 +73,7 @@ class MaskTransformer(nn.Module):
         num_patches_to_mask = 2
 
         patch_indices = torch.randint(
-            low=0,
-            high=num_patches,
-            size=(num_batches, num_patches_to_mask)
+            low=0, high=num_patches, size=(num_batches, num_patches_to_mask)
         )
 
         print("Patch indices:", patch_indices.shape)
@@ -87,6 +98,7 @@ class MaskTransformer(nn.Module):
     def forward(self, x):
         return self.mask_patches(x)
 
+
 class FourierDiscriminator(nn.Module):
     def __init__(self, image_size=224):
         super(FourierDiscriminator, self).__init__()
@@ -109,12 +121,13 @@ class FourierDiscriminator(nn.Module):
         x = x.flatten()
         return self.model(x)
 
+
 class DiffusionHelper:
     def __init__(
-        self,
-        max_beta = .02,
-        min_beta = .0001,
-        num_time_steps = 1000
+        self: "DiffusionHelper",
+        max_beta: float = 2e-2,
+        min_beta: float = 1e-4,
+        num_time_steps: int = 1000,
     ):
         self.max_beta = max_beta
         self.min_beta = min_beta
@@ -125,147 +138,187 @@ class DiffusionHelper:
         self.alpha_bar = torch.cumprod(self.alphas, 0)
 
     def corrupt_sample(
-        self,
+        self: "DiffusionHelper",
         x: Union[int, torch.Tensor],
-        t: Union[int, torch.Tensor] = 0
-    ):
+        t: Union[int, torch.Tensor] = 0,
+    ) -> Sequence[torch.Tensor]:
         eps = torch.randn_like(x).clamp(0, 1)
-        x = torch.pow(self.alpha_bar[t], .5) * x + torch.pow(1 - self.alpha_bar[t], .5) * eps
+        x = (
+            torch.pow(self.alpha_bar[t], 0.5) * x
+            + torch.pow(1 - self.alpha_bar[t], 0.5) * eps
+        )
         return x, eps
 
     def restore_sample(
-        self,
+        self: "DiffusionHelper",
         x: torch.Tensor,
         eps: Optional[Union[int, torch.Tensor]] = None,
-        t: Union[int, torch.Tensor] = 0
-    ):
+        t: Union[int, torch.Tensor] = 0,
+    ) -> torch.Tensor:
         if eps is None:
             eps = torch.randn_like(x).clamp(0, 1)
-        return (x - torch.pow(1 - self.alpha_bar[t], .5) * eps) / torch.pow(self.alpha_bar[t], .5)
+        return (x - torch.pow(1 - self.alpha_bar[t], 0.5) * eps) / torch.pow(
+            self.alpha_bar[t], 0.5
+        )
 
-    def sample_from_time_steps(self, num_time_steps: int =32):
-        time_steps = torch.randint(low=0, high = self.num_time_steps, size=(num_time_steps,))
+    def sample_from_time_steps(
+        self: "DiffusionHelper", num_time_steps: int = 32
+    ) -> torch.Tensor:
+        time_steps = torch.randint(
+            low=0, high=self.num_time_steps, size=(num_time_steps,)
+        )
         return time_steps
 
     def generate_corrupted_samples(
-        self,
-        x: Union[int, torch.Tensor],
-        num_time_steps: int = 1
-    ):
+        self: "DiffusionHelper", x: Union[int, torch.Tensor], num_time_steps: int = 1
+    ) -> Sequence[torch.Tensor]:
         t = self.sample_from_time_steps(num_time_steps)
-        return self.corrupt_sample(x=x, t=t), t
+
+        output = self.corrupt_sample(x=x, t=t)
+        corrupted_samples, noise = output
+
+        return corrupted_samples, noise, t
 
 
 class UNetConvBlock(nn.Module):
     def __init__(
-        self,
-        kernel_size = 3,
-        in_channels = 3,
-        out_channels = 3,
-        stride = 1,
-        padding = 1,
-        dilation = 1,
-        pool = False,
+        self: "UNetConvBlock",
+        embedding_dim: int = 512,
+        kernel_size: int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
+        pool: bool = False,
     ):
         super().__init__()
 
         self.pool = pool
         self.conv1 = nn.Conv2d(
-            in_channels = in_channels,
-            out_channels = out_channels,
-            kernel_size = kernel_size,
-            stride = stride,
-            padding = padding,
-            dilation = dilation
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
         )
         self.conv2 = nn.Conv2d(
-            in_channels = out_channels,
-            out_channels = out_channels,
-            kernel_size = kernel_size,
-            stride = stride,
-            padding = padding,
-            dilation = dilation
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
         )
 
-    def forward(self, x):
+        self.time_projector = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(in_features=embedding_dim, out_features=out_channels)
+        )
+
+    def forward(self: "UNetConvBlock", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
 
-        return F.max_pool2d(x, kernel_size=2) if self.pool else x
+        if self.pool:
+            x = F.max_pool2d(x, kernel_size=2)
+
+        xt = self.time_projector(t).unsqueeze(-1).unsqueeze(-1)
+        xt = xt.expand(*xt.shape[:2], *x.shape[-2:])
+
+        return x + xt
 
 
 class UNetConvTransposeBlock(nn.Module):
     def __init__(
-        self,
-        kernel_size=3,
-        in_channels=3,
-        out_channels=3,
-        stride=1,
-        padding=1,
-        dilation=1
+        self: "UNetConvTransposeBlock",
+        kernel_size: int = 3,
+        embedding_dim: int = 512,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
     ):
         super().__init__()
 
         self.conv1 = nn.ConvTranspose2d(
-            in_channels=in_channels*2,
+            in_channels=in_channels * 2,
             out_channels=in_channels,
             kernel_size=2,
-            stride = 1,
-            dilation = 2,
-            padding = 1,
+            stride=1,
+            dilation=2,
+            padding=1,
         )
 
         self.conv_block = UNetConvBlock(
-            kernel_size = kernel_size,
-            in_channels = in_channels*2,
-            out_channels = in_channels,
-            stride = stride,
-            padding = padding,
-            dilation = dilation,
-            pool = False,
+            embedding_dim=embedding_dim,
+            kernel_size=kernel_size,
+            in_channels=in_channels * 2,
+            out_channels=in_channels,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            pool=False,
         )
 
-    def forward(self, x, residual_x):
-        x = F.upsample(x, scale_factor=2)
-        print("x (before  conv): ", x.shape)
+        self.time_projector = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(in_features=embedding_dim, out_features=in_channels)
+        )
+
+    def forward(
+        self: "UNetConvTransposeBlock", x: torch.Tensor, t: torch.Tensor, residual_x: torch.Tensor
+    ) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2)
         x = self.conv1(x)
 
-        print("Residual x: ", residual_x.shape)
-        print("x (after conv): ", x.shape)
+        x = torch.cat(tensors=[x, residual_x], dim=1)
+        x = self.conv_block(x, t)
 
-        x = torch.cat([x, residual_x], dim=1)
+        xt = self.time_projector(t).unsqueeze(-1).unsqueeze(-1)
+        xt = xt.expand(*xt.shape[:2], *x.shape[-2:])
 
-        return self.conv_block(x)
+        return x + xt
+
 
 class UNetEncoder(nn.Module):
     def __init__(
-        self,
-        num_blocks = 3,
-        kernel_size=3,
-        in_channels=3,
-        out_channels=3,
-        stride=1,
-        padding=1,
-        dilation=1
+        self: "UNetEncoder",
+        num_blocks: int = 3,
+        embedding_dim: int = 512,
+        kernel_size: int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
     ):
         super().__init__()
 
         channels = [
-            ((in_channels if i == 0 else out_channels * 2 ** (i - 1)), out_channels * 2 ** i)
-            for i in range(0, num_blocks,)
+            (
+                (in_channels if i == 0 else out_channels * 2 ** (i - 1)),
+                out_channels * 2**i,
+            )
+            for i in range(
+                0,
+                num_blocks,
+            )
         ]
-
-        print("Encoder channels: ", channels)
 
         blocks = [
             UNetConvBlock(
                 kernel_size=kernel_size,
+                embedding_dim=embedding_dim,
                 in_channels=channel_pair[0],
                 out_channels=channel_pair[1],
                 stride=stride,
                 padding=padding,
                 dilation=dilation,
-                pool=i != len(channels),
+                pool=True,
+                # pool=i != len(channels),
             )
             for i, channel_pair in enumerate(channels, 1)
         ]
@@ -274,60 +327,121 @@ class UNetEncoder(nn.Module):
 
         self.activation_bank = []
 
-    def forward(self, x):
+    def forward(self: "UNetEncoder", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x)
+            x = block(x, t)
             self.activation_bank.append(x)
         return x
 
+
 class UNetBottleneck(nn.Module):
     def __init__(
-        self,
-        kernel_size=3,
-        in_channels=3,
-        out_channels=3,
-        stride=1,
-        padding=1,
-        dilation=1
+        self: "UNetBottleneck",
+        kernel_size: int = 3,
+        embedding_dim: int = 512,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
     ):
         super().__init__()
 
         self.layer = UNetConvBlock(
+            embedding_dim=embedding_dim,
             kernel_size=kernel_size,
             in_channels=in_channels,
             out_channels=out_channels,
             stride=stride,
             padding=padding,
             dilation=dilation,
-            pool=True # TODO: Bears investigating; should be False ideally.
+            pool=True,  # TODO: Bears investigating; should be False ideally.
         )
 
-    def forward(self, x):
-        return self.layer(x)
+    def forward(self: "UNetBottleneck", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.layer(x, t)
+
+
+class UNetMHSABottleneck(nn.Module):
+    def __init__(self, in_channels=3, feature_dim=1024, num_heads=32, dropout=0.1):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.attn = nn.MultiheadAttention(
+            feature_dim, num_heads, dropout=dropout, batch_first=True
+        )
+
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=in_channels * 2,
+            kernel_size=1,
+            stride=2,
+            dilation=1,
+            padding=0,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x = x.view(B, C, H * W)
+        values = self.attn(key=x, query=x, value=x, need_weights=False)[0]
+        return self.conv1(values.contiguous().view(B, C, H, W) + x.contiguous().view(B, C, H, W))
+
+
+class UNetMHCA(nn.Module):
+    def __init__(self, in_channels=3, feature_dim=1024, num_heads=32, dropout=0.1):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.attn = nn.MultiheadAttention(
+            feature_dim, num_heads, dropout=dropout, batch_first=True
+        )
+
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=in_channels * 2,
+            kernel_size=1,
+            stride=2,
+            dilation=1,
+            padding=0,
+        )
+
+    def forward(self, key: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        key = key.flatten(2)
+
+        B, C, H, W = query.shape
+        query = query.view(B, C, H, W)
+
+        results = self.attn(key=key, query=query, value=key, need_weights=False)[0]
+
+        return self.conv1(results.contiguous().view(B, C, H, W) + query.contiguous().view(B, C, H, W))
+
 
 class UNetDecoder(nn.Module):
     def __init__(
-        self,
-        num_blocks=3,
-        kernel_size=3,
-        in_channels=3,
-        out_channels=3,
-        stride=1,
-        padding=1,
-        dilation=1
+        self: "UNetDecoder",
+        num_blocks: int = 3,
+        embedding_dim: int = 512,
+        kernel_size: int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
     ):
         super().__init__()
 
         channels = [
-            (in_channels * 2 ** i, (out_channels if i == 0 else in_channels * 2 ** (i - 1)))
+            (
+                in_channels * 2**i,
+                (out_channels if i == 0 else in_channels * 2 ** (i - 1)),
+            )
             for i in reversed(range(0, num_blocks))
         ]
-
-        print("Decoder channels: ", channels)
 
         self.blocks = [
             UNetConvTransposeBlock(
                 kernel_size=kernel_size,
+                embedding_dim = embedding_dim,
                 in_channels=channel_pair[0],
                 out_channels=channel_pair[1],
                 stride=stride,
@@ -338,34 +452,50 @@ class UNetDecoder(nn.Module):
         ]
 
         self.blocks = nn.Sequential(*self.blocks)
+        self.final_conv = nn.ConvTranspose2d(
+            in_channels=channels[-1][0],
+            out_channels=channels[-1][-1],
+            kernel_size=2,
+            stride=2,
+            dilation=1,
+            padding=0,
+        )
 
-        self.activation_bank = []
-
-    def forward(self, x, residual_xs):
+    def forward(
+        self: "UNetDecoder", x: torch.Tensor, t: torch.Tensor, residual_xs: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
         num_blocks = len(residual_xs)
         for i, block in enumerate(self.blocks):
             residual_x = residual_xs[num_blocks - i - 1]
-            x = block(x, residual_x)
+            x = block(x, t, residual_x)
 
-        return x
+        return self.final_conv(x)
 
 
 class UNet(nn.Module):
     def __init__(
-        self,
-        num_blocks=3,
-        kernel_size=3,
-        in_channels=3,
-        out_channels=3,
-        stride=1,
-        padding=1,
-        dilation=1
+        self: "UNet",
+        num_blocks: int = 3,
+        embedding_dim: int = 512,
+        num_timesteps: int = 1000,
+        kernel_size: int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
     ):
         super().__init__()
 
         self.num_blocks = num_blocks
 
+        self.time_embed = TimeEmbedding(
+            embedding_dim=embedding_dim,
+            num_embeddings=num_timesteps
+        )
+
         self.encoder = UNetEncoder(
+            embedding_dim=embedding_dim,
             kernel_size=kernel_size,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -378,13 +508,14 @@ class UNet(nn.Module):
         self.bottleneck = UNetBottleneck(
             kernel_size=kernel_size,
             in_channels=out_channels * 2 ** (num_blocks - 1),
-            out_channels=out_channels * 2 ** num_blocks,
+            out_channels=out_channels * 2**num_blocks,
             stride=stride,
             padding=padding,
             dilation=dilation,
         )
 
         self.decoder = UNetDecoder(
+            embedding_dim=embedding_dim,
             kernel_size=kernel_size,
             in_channels=out_channels,
             out_channels=in_channels,
@@ -394,13 +525,108 @@ class UNet(nn.Module):
             num_blocks=num_blocks,
         )
 
-    def forward(self, x):
-        x_ = self.encoder(x)
+    def forward(self: "UNet", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = self.time_embed(t)
+        x_ = self.encoder(x, t)
+
+        residual_xs = self.encoder.activation_bank
+        x_ = self.bottleneck(x_, t)
+
+        return self.decoder(x_, t, residual_xs)
+
+
+class UNetTransformer(nn.Module):
+    def __init__(
+        self: "UNet",
+        num_blocks: int = 3,
+        embedding_dim : int = 512,
+        num_timesteps: int = 1000,
+        kernel_size: int = 3,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
+    ):
+        super().__init__()
+
+        self.num_blocks = num_blocks
+        self.num_timesteps = num_timesteps
+        self.embedding_dim = embedding_dim
+
+        self.time_embed = TimeEmbedding(
+            embedding_dim=embedding_dim,
+            num_embeddings=num_timesteps
+        )
+
+        self.encoder = UNetEncoder(
+            embedding_dim=embedding_dim,
+            kernel_size=kernel_size,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            num_blocks=num_blocks,
+        )
+
+        self.bottleneck = UNetMHSABottleneck(
+            in_channels=out_channels * 2 ** (num_blocks - 1),
+            feature_dim=100,
+            num_heads=5,
+            dropout=0.1,
+        )
+
+        self.decoder = UNetDecoder(
+            embedding_dim=embedding_dim,
+            kernel_size=kernel_size,
+            in_channels=out_channels,
+            out_channels=in_channels,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            num_blocks=num_blocks,
+        )
+
+    def forward(self: "UNet", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t = self.time_embed(t).squeeze(-1)
+
+        x_ = self.encoder(x, t)
         residual_xs = self.encoder.activation_bank
         x_ = self.bottleneck(x_)
-        return self.decoder(x_, residual_xs)
 
-if  __name__ == "__main__":
+        return self.decoder(x_, t, residual_xs)
+
+
+class TimeEmbedding(nn.Module):
+    def __init__(self : "TimeEmbedding", num_embeddings : int = 1000, embedding_dim : int = 1024, dropout_rate : float =0.1):
+        super().__init__()
+
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.dropout_rate = dropout_rate
+
+        position = torch.arange(num_embeddings).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, embedding_dim, 2)
+            * (-torch.log(torch.tensor([10000.0])) / embedding_dim)
+        )
+
+        pos_encoding = torch.zeros(num_embeddings, embedding_dim)
+
+        pos_encoding[:, 0::2] = torch.sin(position * div_term)
+        pos_encoding[:, 1::2] = torch.cos(position * div_term)
+
+        self.register_buffer("pos_encoding", pos_encoding.unsqueeze(0))
+
+        self.dropout = nn.Dropout1d(p=dropout_rate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        encoding = self.pos_encoding[:, x, :].squeeze(0)
+        return self.dropout(encoding)
+
+
+if __name__ == "__main__":
     hidden_size = 1024
 
     # batch_size = 3
@@ -455,21 +681,38 @@ if  __name__ == "__main__":
     in_channels = 3
     out_channels = 64
     num_blocks = 4
+    embedding_dim = 512
+    num_time_steps = 100
 
-    # block1 = UNetConvBlock(in_channels=in_channels, out_channels=out_channels, pool=True)
-    # block2 = UNetConvTransposeBlock(in_channels=out_channels, out_channels=in_channels)
-    # block = nn.Sequential(block1, block2)
-    #
-    # block1 = UNetEncoder(in_channels=in_channels, out_channels=out_channels, num_blocks=num_blocks)
-    # block2 = UNetDecoder(in_channels=out_channels, out_channels=in_channels, num_blocks=num_blocks)
-    # bneck = UNetBottleneck(in_channels=out_channels * 2**(num_blocks-1), out_channels=out_channels* 2**num_blocks)
-    #
-    # block = nn.Sequential(block1, bneck, block2)
+    unet = UNet(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        num_blocks=num_blocks,
+        num_timesteps=num_time_steps,
+        embedding_dim=embedding_dim
+    )
+    unet_transformer = UNetTransformer(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        num_blocks=num_blocks,
+        num_timesteps=num_time_steps,
+        embedding_dim=embedding_dim
+    )
 
-    unet = UNet(in_channels=in_channels, out_channels=out_channels, num_blocks=num_blocks)
+    batch_size = 5
 
-    x = torch.randn(1, in_channels, 160, 160)
+    x = torch.randn(batch_size, in_channels, 160, 160)
+    t = torch.randint(0, num_time_steps, (batch_size, ))
 
     print(unet)
+    summary(unet, input_data=[x, t])
+    summary(unet_transformer, input_data=[x, t])
 
-    print(summary(unet, input_data=x))
+    prop = (
+        100
+        * sum(n.numel() for n in unet_transformer.parameters())
+        / sum(n.numel() for n in unet.parameters())
+    )
+    print(prop)
+
+    # summary(unet, input_data=x)

@@ -8,11 +8,8 @@ from torchvision import transforms as T
 
 from random import shuffle
 
-__all__ = [
-    "AlzheimerData",
-    "AlzheimerDataset",
-    "MNISTDataset"
-]
+__all__ = ["AlzheimerData", "AlzheimerDataset", "MNISTDataset"]
+
 
 class AlzheimerData(Dataset):
     def __init__(self, path, train=True):
@@ -37,18 +34,14 @@ class AlzheimerData(Dataset):
         self.files = files
 
         self.transforms = T.Compose(
-            [
-                T.ToTensor(),
-                T.Resize(128),
-                T.Normalize(mean=.5, std=.5)
-            ]
+            [T.ToTensor(), T.Resize(128), T.Normalize(mean=0.5, std=0.5)]
         )
 
         self.label_map = {
             "NonDemented": 0,
             "VeryMildDemented": 1,
             "MildDemented": 2,
-            "ModerateDemented": 3
+            "ModerateDemented": 3,
         }
 
     def __getitem__(self, index):
@@ -63,20 +56,23 @@ class AlzheimerData(Dataset):
     def from_folder(cls, path):
         return ConcatDataset([cls(path=path, train=True), cls(path=path, train=False)])
 
+
 class AlzheimerDataset(Dataset):
     def __init__(self, path):
         super().__init__()
         self.dataset = ConcatDataset(
             [
                 AlzheimerData(path=path, train=True),
-                AlzheimerData(path=path, train=False)
+                AlzheimerData(path=path, train=False),
             ]
         )
+
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
         return self.dataset[index]
+
 
 class MNISTDataset(Dataset):
     def __init__(self, input_size=64):
@@ -90,12 +86,12 @@ class MNISTDataset(Dataset):
             [
                 T.ToTensor(),
                 T.Resize((input_size, input_size)),
-                T.Normalize(mean=.5, std=.5)
+                T.Normalize(mean=0.5, std=0.5),
             ]
         )
 
-        A = MNIST(root='./data', train=True, download=True, transform=self.transforms)
-        B = MNIST(root='./data', train=False, download=True, transform=self.transforms)
+        A = MNIST(root="./data", train=True, download=True, transform=self.transforms)
+        B = MNIST(root="./data", train=False, download=True, transform=self.transforms)
 
         self.dataset = ConcatDataset([A, B])
 
