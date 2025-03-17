@@ -147,6 +147,9 @@ model = UNetTransformer(
     embedding_dim=embedding_dim
 ).to(device)
 
+#### Compile model with torch.compile
+model = torch.compile(model, mode="max-autotune")
+
 model = model.train()
 
 ##### Parameter filtering and grouping
