@@ -14,7 +14,7 @@ from src.deeplense.dataset import DeepLenseDiffusionDataset, DiffusionHelper
 
 from loguru import logger
 
-logger.add("app.log")
+logger.add(sink="app.log")
 
 ##### Ensure reproducibility
 torch.backends.cudnn.deterministic = True
@@ -27,15 +27,17 @@ torch.manual_seed(SEED)
 ##### Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+##### Enable TF32 and BF16 operations
+torch.set_float32_matmul_precision(precision="medium")
 
 ##### Model architecture
 in_channels = 1
-out_channels = 64
+out_channels = 32 # TODO: Originally 64.
 num_blocks = 4
 input_size = 160
 
-embedding_dim = 128
-num_time_steps = 500
+embedding_dim = 128 # TODO: Originally 128.
+num_time_steps = 512
 
 model_params = dict(
     in_channels=in_channels,
@@ -47,7 +49,7 @@ model_params = dict(
 
 ##### Data preparation
 num_classes = 10
-batch_size = 8  # TODO: Experiment with batch size (original: 16)
+batch_size = 64  # TODO: Experiment with batch size (original: 16)
 num_workers = 0
 pin_memory = True
 min_beta = 1e-4
@@ -68,14 +70,14 @@ layers = [8, 17, 25]  # VGG layers for content loss
 progressive_weights = False  # Ramp up VGG layer importance with depth
 
 ##### Training process
-epochs = 20  # TODO: Experiment with this (original: 10)
+epochs = 30  # TODO: Experiment with this (original: 10)
 
-decoder_lr = 1e-4  # TODO: Experiment with this (original: 1e-4)
-encoder_lr = 1e-4  # TODO: Experiment with this (original: 1e-4)
-bottleneck_lr = 1e-4
+decoder_lr = 3e-4  # TODO: Experiment with this (original: 1e-4)
+encoder_lr = 3e-4  # TODO: Experiment with this (original: 1e-4)
+bottleneck_lr = 3e-4
 
 weight_decay = 1e-2
-grad_accum_steps = 64
+grad_accum_steps = 128 # TODO: Originally 64.
 
 training_params = dict(
     epochs=epochs,
@@ -111,7 +113,8 @@ except:
 with open(f"{checkpoint_dir}/params.json", "w") as fp:
     json.dump(final_params, fp, indent=4)
 
-logger.info(f"Events being logged at {BASE_DIR}\n")
+logger.info(f"Events being logged at {checkpoint_dir}\n")
+logger.info(f"Selected device: {str(device).upper()}\n")
 
 ##### Generate dataloaders
 diffusion_helper = DiffusionHelper(
@@ -148,7 +151,8 @@ model = UNetTransformer(
 ).to(device)
 
 #### Compile model with torch.compile
-model = torch.compile(model, mode="max-autotune")
+# backend = "aoteager"
+model = torch.compile(model)
 
 model = model.train()
 
@@ -176,8 +180,9 @@ param_groups.append(encoder_params)
 param_groups.append(bottleneck_params)
 param_groups.append(decoder_params)
 
-##### Optimizer instantiation
-optimizer = optim.AdamW(params=param_groups, lr=encoder_lr, weight_decay=weight_decay)
+##### Optimizer instantiation TODO: Use fused=True
+optimizer = optim.AdamW(params=param_groups, lr=encoder_lr, weight_decay=weight_decay, fused=True)
+lr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=50, T_mult=2, eta_min=0, verbose=True)
 
 ##### Objective function instantiation
 criterion = DiffusionLoss()
@@ -203,10 +208,14 @@ val_losses_ = torch.zeros(epochs)
 
 iter_ = 0
 epoch_loss_ = 0.
+iter_loss_ = 0.
+
+# Scale gradients
 scaler = torch.amp.GradScaler(device=str(device))
 
 for epoch in range(1, epochs + 1):
     epoch_loss = 0.
+    iter_loss = 0.
 
     for i, (x, x_t, t, noise) in enumerate(iter(train_dl), 1):
         # Calculate training iteration
@@ -217,28 +226,31 @@ for epoch in range(1, epochs + 1):
         t = t.to(device).squeeze(-1)
         noise = noise.to(device)
 
-        with torch.amp.autocast(enabled=True, device_type=str(device)):
-            noise_hat = torch.tanh(model(x_t, t))
+        # TODO: Changed autocast dtype from bfloat16 since it was too slow! Look into this.
+        with torch.autocast(enabled=True, dtype = torch.float16, device_type=str(device)):
+            noise_hat = model(x_t, t)
 
             # Calculate loss and back-propagate
             # Use gradient accumulation if required.
             loss = criterion(noise_hat, noise) / grad_accum_steps
 
-        scaler.scale(loss).backward()
+        # scaler.scale(loss).backward()
+        loss.backward()
 
         del x, x_t, t, noise
         gc.collect()
 
         if iter_ % grad_accum_steps == 0 or iter_ == total_num_iters:
-            scaler.step(optimizer)
-            scaler.update()
+            # scaler.step(optimizer)
+            # scaler.update()
 
+            optimizer.step()
             optimizer.zero_grad()
 
-            logger.info(f"Iteration ({int(iter_)}/{int(total_num_iters)}); Loss: {epoch_loss_:.4f}")
+            logger.info(f"Iteration ({int(iter_)}/{int(total_num_iters)}); Loss: {iter_loss_:.4f}")
 
             torch.clear_autocast_cache()
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
             checkpoint = {
                 "model": model.eval().state_dict(),
@@ -251,13 +263,20 @@ for epoch in range(1, epochs + 1):
                 "epochs": epochs,
             }
 
-            torch.save(checkpoint, f"{checkpoint_dir}/iteration_{int(iter_)}_checkpoint.pt")
+            torch.save(checkpoint, f"{checkpoint_dir}/iteration_{int(iter_)}_loss_{iter_loss_:.4f}_checkpoint.pt")
 
         gc.collect()
+        lr_scheduler.step()
 
         # Update loss values
         epoch_loss += loss.item()
-        epoch_loss_ = epoch_loss / iter_
+        epoch_loss_ += loss.item()
+
+        iter_loss_ = epoch_loss_ / iter_
+
+        ## Clear CUDA memory as best as possible
+        torch.clear_autocast_cache()
+        # torch.cuda.empty_cache()
 
     epoch_loss = epoch_loss / num_image_samples
     logger.info(f"Epoch {epoch} complete! Loss: {epoch_loss: .4f}")
