@@ -130,16 +130,30 @@ class DiffusionHelper:
         max_beta: float = 2e-2,
         min_beta: float = 1e-4,
         num_time_steps: int = 1000,
+        offset: float = 8e-3,
         device: str = "cpu"
     ):
         self.max_beta = max_beta
         self.min_beta = min_beta
         self.num_time_steps = num_time_steps
         self.device = str(device)
+        self.offset = offset
 
-        self.betas = torch.linspace(self.min_beta, self.max_beta, self.num_time_steps).to(device)
+        self.generate_linear_schedule()
+
+    def generate_linear_schedule(self):
+        self.betas = torch.linspace(self.min_beta, self.max_beta, self.num_time_steps).to(self.device)
         self.alphas = 1 - self.betas
         self.alpha_bar = torch.cumprod(self.alphas, 0)
+
+    def generate_cosine_schedule(self):
+        t_tensor = torch.arange(0, self.num_time_steps)
+        angle = (self.offset + t_tensor / self.num_time_steps) / (1 + self.offset)
+        angle *= torch.pi / 2
+
+        self.alpha_bar =  torch.cos(angle) ** 2
+        self.alpha_bar = self.alpha_bar[1:] / self.alpha_bar[0]
+        self.betas = 1 - self.alpha_bar/(self.alpha_bar - 1)
 
     def corrupt_sample(
         self: "DiffusionHelper",
