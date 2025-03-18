@@ -357,8 +357,11 @@ class UNetConvTransposeBlock(nn.Module):
         x = F.interpolate(x, scale_factor=2)
         x = self.conv1(x)
 
-        x = torch.cat(tensors=[x, residual_x], dim=1)
-        x = self.conv_block(x, t)
+        # Concatenate to get x_ as residual path
+        x_ = torch.cat(tensors=[x, residual_x], dim=1)
+
+        # Combine residual path (i.e., x_) with identity func i.e., x
+        x = self.conv_block(x_, t) + x
 
         xt = self.time_projector(t)[:, :, None, None]
         xt = xt.repeat(1, 1, *x.shape[-2:])
