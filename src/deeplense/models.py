@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import gc
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint_sequential
@@ -20,7 +21,8 @@ __all__ = [
     "UNetEncoder",
     "UNetDecoder",
     "UNetBottleneck",
-    "UNetMHSABottleneck",
+    "UNetSelfAttention",
+    "UNetSelfAttentionBottleneck",
     "UNet",
     "UNetTransformer",
 ]
@@ -128,56 +130,137 @@ class DiffusionHelper:
         max_beta: float = 2e-2,
         min_beta: float = 1e-4,
         num_time_steps: int = 1000,
+        device: str = "cpu"
     ):
         self.max_beta = max_beta
         self.min_beta = min_beta
         self.num_time_steps = num_time_steps
+        self.device = str(device)
 
-        self.betas = torch.linspace(self.min_beta, self.max_beta, self.num_time_steps)
+        self.betas = torch.linspace(self.min_beta, self.max_beta, self.num_time_steps).to(device)
         self.alphas = 1 - self.betas
         self.alpha_bar = torch.cumprod(self.alphas, 0)
 
     def corrupt_sample(
         self: "DiffusionHelper",
+        x: torch.Tensor,
+        t: Union[int, torch.Tensor] = 0,
+    ) -> Sequence[torch.Tensor]:
+        batch = True
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+            batch = False
+            if isinstance(t, int):
+                t = torch.tensor([t])
+
+        x, eps = self.corrupt_batch(x=x.to(self.device), t=t.to(self.device))
+
+        return (x, eps) if batch else (x.squeeze(0), eps.squeeze(0))
+
+    def corrupt_batch(
+        self: "DiffusionHelper",
         x: Union[int, torch.Tensor],
         t: Union[int, torch.Tensor] = 0,
     ) -> Sequence[torch.Tensor]:
         eps = torch.randn_like(x).clamp(0, 1)
+        alpha_bar = self.alpha_bar[t][:, None, None, None]
+
         x = (
-            torch.pow(self.alpha_bar[t], 0.5) * x
-            + torch.pow(1 - self.alpha_bar[t], 0.5) * eps
+            torch.pow(alpha_bar, 0.5) * x
+            + torch.pow(1 - alpha_bar, 0.5) * eps
         )
         return x, eps
 
-    def restore_sample(
+    def restore_sample_(
         self: "DiffusionHelper",
-        x: torch.Tensor,
-        eps: Optional[Union[int, torch.Tensor]] = None,
+        x_t: torch.Tensor,
+        noise: Optional[Union[int, torch.Tensor]] = None,
         t: Union[int, torch.Tensor] = 0,
     ) -> torch.Tensor:
-        if eps is None:
-            eps = torch.randn_like(x).clamp(0, 1)
-        return (x - torch.pow(1 - self.alpha_bar[t], 0.5) * eps) / torch.pow(
-            self.alpha_bar[t], 0.5
-        )
+        if noise is None:
+            noise = torch.randn_like(x_t).clamp(0, 1)
 
-    def sample_from_time_steps(
+        eps = torch.randn_like(x_t).clamp(0, 1)
+        # pred = x - torch.pow(1 - self.alpha_bar[t], 0.5) * noise
+
+        noise = (1 - self.alphas[t]) * noise / torch.pow(1 - self.alpha_bar[t], 0.5)
+        noise = (x_t - noise) / torch.pow(self.alphas[t], 0.5)
+
+        return noise + eps * torch.pow(self.betas[t], .5)
+
+    def restore_sample(
+        self: "DiffusionHelper",
+        x_t: torch.Tensor,
+        noise: Optional[Union[int, torch.Tensor]] = None,
+        t: Union[int, torch.Tensor] = 0,
+    ) -> torch.Tensor:
+        batch = True
+        if x_t.ndim == 3:
+            batch = False
+            x_t = x_t.unsqueeze(0)
+
+        x = self.restore_batch(x_t=x_t, noise_hat=noise, t=t)
+
+        return x if batch else x.squeeze(0)
+
+    def restore_batch(
+        self: "DiffusionHelper",
+        x_t: torch.Tensor,
+        noise_hat: Optional[Union[int, torch.Tensor]],
+        t: Union[int, torch.Tensor] = 0,
+    ) -> torch.Tensor:
+        alphas = self.alphas[t][:, None, None, None]
+        alpha_bar = self.alpha_bar[t][:, None, None, None]
+        betas = 1 - alphas
+
+        z = torch.randn_like(x_t)
+        z[t == 1] = 0
+
+        noise = betas * noise_hat / torch.sqrt(1 - alpha_bar)
+        noise = (x_t - noise) / torch.sqrt(alphas)
+
+        return noise + z * torch.sqrt(betas)
+
+    def sample_time_steps(
         self: "DiffusionHelper", num_time_steps: int = 32
     ) -> torch.Tensor:
         time_steps = torch.randint(
-            low=0, high=self.num_time_steps, size=(num_time_steps,)
+            low=1, high=self.num_time_steps, size=(num_time_steps,)
         )
         return time_steps
 
+    def generate_image_samples(self, model, x_t=None, batch_size = 1, channels = 1, input_size=None):
+        model = model.eval().to(self.device)
+        if x_t is None:
+            x_t = torch.randn(batch_size, channels, input_size, input_size)
+
+        x_t = x_t.to(self.device)
+
+        for t_ in reversed(range(1, self.num_time_steps)):
+            t = torch.ones(batch_size, dtype = torch.int32).fill_(t_).to(self.device)
+            noise_hat = model(x_t, t)
+            x_t = self.restore_batch(x_t=x_t, t=t, noise_hat=noise_hat)
+            print(f"Time step: {t_}")
+
+            gc.collect()
+
+        return x_t
+
     def generate_corrupted_samples(
-        self: "DiffusionHelper", x: Union[int, torch.Tensor], num_time_steps: int = 1
+        self: "DiffusionHelper", x: torch.Tensor, num_time_steps: int = 1
     ) -> Sequence[torch.Tensor]:
-        t = self.sample_from_time_steps(num_time_steps)
+        t = self.sample_time_steps(num_time_steps)
 
         output = self.corrupt_sample(x=x, t=t)
         corrupted_samples, noise = output
 
         return corrupted_samples, noise, t
+
+    def __str__(self):
+        return f"{self.__class__.__name__}(min_beta={self.min_beta}, max_beta={self.max_beta}, num_time_steps={self.num_time_steps}, device={self.device})"
+
+    def __repr__(self):
+        return self.__str__()
 
 
 class UNetConvBlock(nn.Module):
@@ -218,14 +301,14 @@ class UNetConvBlock(nn.Module):
         )
 
     def forward(self: "UNetConvBlock", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv2(x))
 
         if self.pool:
             x = F.max_pool2d(x, kernel_size=2)
 
-        xt = self.time_projector(t).unsqueeze(-1).unsqueeze(-1)
-        xt = xt.expand(*xt.shape[:2], *x.shape[-2:])
+        xt = self.time_projector(t)[:, :, None, None]
+        xt = xt.repeat(1, 1, *x.shape[-2:])
 
         return x + xt
 
@@ -277,8 +360,8 @@ class UNetConvTransposeBlock(nn.Module):
         x = torch.cat(tensors=[x, residual_x], dim=1)
         x = self.conv_block(x, t)
 
-        xt = self.time_projector(t).unsqueeze(-1).unsqueeze(-1)
-        xt = xt.expand(*xt.shape[:2], *x.shape[-2:])
+        xt = self.time_projector(t)[:, :, None, None]
+        xt = xt.repeat(1, 1, *x.shape[-2:])
 
         return x + xt
 
@@ -362,8 +445,15 @@ class UNetBottleneck(nn.Module):
         return self.layer(x, t)
 
 
-class UNetMHSABottleneck(nn.Module):
-    def __init__(self, in_channels=3, feature_dim=1024, num_heads=32, dropout=0.1):
+class UNetSelfAttentionBottleneck(nn.Module):
+    def __init__(
+        self: "UNetSelfAttentionBottleneck",
+        in_channels: int = 3,
+        feature_dim: int = 1024,
+        embedding_dim: int = 512,
+        num_heads: int = 32,
+        dropout: float = 0.1
+    ):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_heads = num_heads
@@ -380,15 +470,28 @@ class UNetMHSABottleneck(nn.Module):
             padding=0,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.time_projector = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(in_features=embedding_dim, out_features=in_channels)
+        )
+
+    def forward(self: "UNetSelfAttentionBottleneck", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        # FIXME: Allow time information to pass through bottleneck. Forgot that before!
+        xt = self.time_projector(t)[:, :, None, None]
+        xt = xt.repeat(1, 1, *x.shape[-2:])
+
+        x += xt
+
         B, C, H, W = x.shape
         x = x.view(B, C, H * W)
-        values = self.attn(key=x, query=x, value=x, need_weights=False)[0]
-        return self.conv1(values.contiguous().view(B, C, H, W) + x.contiguous().view(B, C, H, W))
+
+        values = F.scaled_dot_product_attention(key=x, query=x, value=x)
+
+        return self.conv1((values + x).contiguous().view(B, C, H, W))
 
 
-class UNetMHCA(nn.Module):
-    def __init__(self, in_channels=3, feature_dim=1024, num_heads=32, dropout=0.1):
+class UNetSelfAttention(nn.Module):
+    def __init__(self, in_channels=3, out_channels: Optional[int] = None, feature_dim=1024, num_heads=32, dropout=0.1):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_heads = num_heads
@@ -396,9 +499,12 @@ class UNetMHCA(nn.Module):
             feature_dim, num_heads, dropout=dropout, batch_first=True
         )
 
+        if out_channels is None:
+            out_channels = in_channels * 2
+
         self.conv1 = nn.Conv2d(
             in_channels=in_channels,
-            out_channels=in_channels * 2,
+            out_channels=out_channels,
             kernel_size=1,
             stride=2,
             dilation=1,
@@ -411,7 +517,7 @@ class UNetMHCA(nn.Module):
         B, C, H, W = query.shape
         query = query.view(B, C, H, W)
 
-        results = self.attn(key=key, query=query, value=key, need_weights=False)[0]
+        results = F.scaled_dot_product_attention(key=key, query=query, value=key, is_causal=False)
 
         return self.conv1(results.contiguous().view(B, C, H, W) + query.contiguous().view(B, C, H, W))
 
@@ -529,10 +635,14 @@ class UNet(nn.Module):
         t = self.time_embed(t)
         x_ = self.encoder(x, t)
 
-        residual_xs = self.encoder.activation_bank
+        residual_xs = self.encoder.activation_bank.copy()
         x_ = self.bottleneck(x_, t)
 
-        return self.decoder(x_, t, residual_xs)
+        # FIXME: Had to clear the activation bank! Was hugging CUDA memory!
+        self.encoder.activation_bank.clear()
+        gc.collect()
+
+        return torch.tanh(self.decoder(x_, t, residual_xs))
 
 
 class UNetTransformer(nn.Module):
@@ -570,9 +680,10 @@ class UNetTransformer(nn.Module):
             num_blocks=num_blocks,
         )
 
-        self.bottleneck = UNetMHSABottleneck(
+        self.bottleneck = UNetSelfAttentionBottleneck(
             in_channels=out_channels * 2 ** (num_blocks - 1),
             feature_dim=100,
+            embedding_dim=embedding_dim,
             num_heads=5,
             dropout=0.1,
         )
@@ -592,10 +703,14 @@ class UNetTransformer(nn.Module):
         t = self.time_embed(t).squeeze(-1)
 
         x_ = self.encoder(x, t)
-        residual_xs = self.encoder.activation_bank
-        x_ = self.bottleneck(x_)
+        residual_xs = self.encoder.activation_bank.copy()
+        x_ = self.bottleneck(x_, t)
 
-        return self.decoder(x_, t, residual_xs)
+        # FIXME: Had to clear the activation bank! Was hugging CUDA memory!
+        self.encoder.activation_bank.clear()
+        gc.collect()
+
+        return torch.tanh(self.decoder(x_, t, residual_xs))
 
 
 class TimeEmbedding(nn.Module):
@@ -657,12 +772,18 @@ if __name__ == "__main__":
     #
     # img_tensor = torch.tensor(img, dtype = torch.float32).unsqueeze_(0).permute(0, 3, 1, 2) / 255.
     # batch_img_tensor = torch.cat([img_tensor for _ in range(2)], dim=0)
-    # diffusion_helper = DiffusionHelper()
     #
-    # t = 500
+    # t = 512
+    # diffusion_helper = DiffusionHelper(num_time_steps=t)
+    #
     # # img_corrupted_tensor, noise = diffusion_helper.corrupt_sample(batch_img_tensor, t = t)
-    # output = diffusion_helper.generate_corrupted_samples(batch_img_tensor)
-    # img_corrupted_tensor, noise, t_ = output[0][0], output[0][1], output[1]
+    # output = diffusion_helper.generate_corrupted_samples(batch_img_tensor, num_time_steps = 1)
+    # img_corrupted_tensor, noise, t_ = output
+    #
+    # print("Sampled time steps: {}".format(t_))
+    #
+    # print(img_corrupted_tensor.shape)
+    # print(output[0].shape)
     #
     # img_corrupted = img_corrupted_tensor[0].squeeze().permute(1, 2, 0).numpy()
     #
@@ -670,13 +791,15 @@ if __name__ == "__main__":
     # plt.title("Corrupted image, t = {}".format(t))
     # plt.show()
     #
-    # img_restored_tensor = diffusion_helper.restore_sample(img_corrupted_tensor, eps=noise, t=t_)[0]
+    # img_restored_tensor = diffusion_helper.restore_batch(x_t=img_corrupted_tensor, noise_hat=noise, t=t_)[0]
     #
     # img_restored = img_restored_tensor.squeeze().permute(1, 2, 0).numpy()
     #
     # plt.imshow(img_restored)
     # plt.title("Restored corrupted image, t = {}".format(t))
     # plt.show()
+
+    # Test out the UNetTransformer
 
     in_channels = 3
     out_channels = 64
@@ -714,5 +837,3 @@ if __name__ == "__main__":
         / sum(n.numel() for n in unet.parameters())
     )
     print(prop)
-
-    # summary(unet, input_data=x)
