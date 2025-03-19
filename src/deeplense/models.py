@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint_sequential
 from torch.utils.data import Dataset, DataLoader
+from torchvision.utils import make_grid
 
 from torch.nn import functional as F
 from torchinfo import summary
@@ -226,14 +227,15 @@ class DiffusionHelper:
         alphas = self.alphas[t][:, None, None, None]
         alpha_bar = self.alpha_bar[t][:, None, None, None]
         betas = 1 - alphas
+        std = torch.sqrt(betas)
+
+        sqrt_alpha_bar_diff = torch.sqrt(1 - alpha_bar)
+        inv_sqrt_alpha = 1 / torch.sqrt(alphas)
 
         z = torch.randn_like(x_t)
-        z[t == 1] = 0
+        z[t <= 1] = 0.
 
-        noise = betas * noise_hat / torch.sqrt(1 - alpha_bar)
-        noise = (x_t - noise) / torch.sqrt(alphas)
-
-        return noise + z * torch.sqrt(betas)
+        return inv_sqrt_alpha * (x_t - (noise_hat * betas / sqrt_alpha_bar_diff)) + z * std
 
     def sample_time_steps(
         self: "DiffusionHelper", num_time_steps: int = 32
@@ -251,7 +253,7 @@ class DiffusionHelper:
         x_t = x_t.to(self.device)
 
         for t_ in reversed(range(1, self.num_time_steps)):
-            t = torch.ones(batch_size, dtype = torch.int32).fill_(t_).to(self.device)
+            t = torch.ones(batch_size, dtype = torch.long).fill_(t_).to(self.device)
             noise_hat = model(x_t, t)
             x_t = self.restore_batch(x_t=x_t, t=t, noise_hat=noise_hat)
             print(f"Time step: {t_}")
@@ -269,6 +271,27 @@ class DiffusionHelper:
         corrupted_samples, noise = output
 
         return corrupted_samples, noise, t
+
+    @torch.inference_mode()
+    def eval(self, model, batch_size = 16, channels = 1, input_size=160):
+        x_t = torch.randn(batch_size, channels, input_size, input_size)
+        x_t = x_t.to(self.device)
+
+        for t_ in reversed(range(1, self.num_time_steps)):
+            t = torch.ones(batch_size, dtype = torch.long).fill_(t_).to(self.device)
+            noise_hat = model(x_t, t)
+            x_t = self.restore_batch(x_t=x_t, t=t, noise_hat=noise_hat)
+            print(f"Time step: {t_}")
+
+            gc.collect()
+
+        viz_tensor = make_grid(x_t, nrow=2).cpu().numpy()
+
+        plt.imshow(viz_tensor)
+        plt.savefig("../../artefacts/deeplense/diffusion/viz_tensor.png")
+        plt.show()
+
+        return
 
     def __str__(self):
         return f"{self.__class__.__name__}(min_beta={self.min_beta}, max_beta={self.max_beta}, num_time_steps={self.num_time_steps}, device={self.device})"
@@ -309,6 +332,9 @@ class UNetConvBlock(nn.Module):
             dilation=dilation,
         )
 
+        self.group_norm1 = nn.GroupNorm(num_groups=1, num_channels=out_channels)
+        self.group_norm2 = nn.GroupNorm(num_groups=1, num_channels=out_channels)
+
         self.time_projector = nn.Sequential(
             nn.GELU(),
             nn.Linear(in_features=embedding_dim, out_features=out_channels)
@@ -316,7 +342,10 @@ class UNetConvBlock(nn.Module):
 
     def forward(self: "UNetConvBlock", x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         x = F.gelu(self.conv1(x))
+        x = self.group_norm1(x)
+
         x = F.gelu(self.conv2(x))
+        x = self.group_norm2(x)
 
         if self.pool:
             x = F.max_pool2d(x, kernel_size=2)
@@ -360,6 +389,9 @@ class UNetConvTransposeBlock(nn.Module):
             pool=False,
         )
 
+        self.group_norm1 = nn.GroupNorm(num_groups=1, num_channels=in_channels)
+        self.group_norm_conv_block = nn.GroupNorm(num_groups=1, num_channels=2*in_channels)
+
         self.time_projector = nn.Sequential(
             nn.GELU(),
             nn.Linear(in_features=embedding_dim, out_features=in_channels)
@@ -370,9 +402,11 @@ class UNetConvTransposeBlock(nn.Module):
     ) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2)
         x = self.conv1(x)
+        x = self.group_norm1(x)
 
         # Concatenate to get x_ as residual path
         x_ = torch.cat(tensors=[x, residual_x], dim=1)
+        x_ = self.group_norm_conv_block(x_)
 
         # Combine residual path (i.e., x_) with identity func i.e., x
         x = self.conv_block(x_, t) + x
@@ -487,6 +521,8 @@ class UNetSelfAttentionBottleneck(nn.Module):
             padding=0,
         )
 
+        self.group_norm = nn.GroupNorm(num_groups=1, num_channels=in_channels)
+
         self.time_projector = nn.Sequential(
             nn.GELU(),
             nn.Linear(in_features=embedding_dim, out_features=in_channels)
@@ -498,6 +534,8 @@ class UNetSelfAttentionBottleneck(nn.Module):
         xt = xt.repeat(1, 1, *x.shape[-2:])
 
         x += xt
+
+        x = self.group_norm(x)
 
         B, C, H, W = x.shape
         x = x.view(B, C, H * W)
@@ -629,6 +667,7 @@ class UNet(nn.Module):
         )
 
         self.bottleneck = UNetBottleneck(
+            embedding_dim=embedding_dim,
             kernel_size=kernel_size,
             in_channels=out_channels * 2 ** (num_blocks - 1),
             out_channels=out_channels * 2**num_blocks,
